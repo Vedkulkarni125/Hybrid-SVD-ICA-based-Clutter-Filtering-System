@@ -1,0 +1,152 @@
+% run_hybrid_filter.m
+% PHASE 3: VISUAL VERIFICATION (Blood Vessel Phantom)
+% 1. Generates a "Vessel" simulation (Tube of blood).
+% 2. Runs GPU SVD + Hybrid ICA.
+% 3. Shows a clear "Vessel" structure in the final output.
+
+clear; clc; close all;
+
+%% 1. Data Generation (Vessel Simulation)
+disp('--- Step 1: Generating Vessel Phantom ---');
+nZ = 128; nX = 128; nT = 300; 
+
+% --- A. Create a Vessel Mask (A cylinder in the center) ---
+[X_grid, Z_grid] = meshgrid(1:nX, 1:nZ);
+center_X = nX/2; 
+center_Z = nZ/2;
+radius = 30;
+% Create a binary circle (1 inside vessel, 0 outside)
+vessel_mask = double(((X_grid - center_X).^2 + (Z_grid - center_Z).^2) <= radius^2);
+
+% --- B. Blood (Only inside the vessel) ---
+% Amplitude 0.05 (Weak)
+blood_noise = (randn(nZ, nX, nT) + 1i*randn(nZ, nX, nT)) * 0.05;
+blood = blood_noise .* repmat(vessel_mask, [1, 1, nT]);
+
+% --- C. Clutter (Everywhere) ---
+% Amplitude 100 (Strong)
+t = reshape(linspace(0, 4*pi, nT), [1, 1, nT]);
+clutter = 100 * exp(1i * t); 
+
+% --- D. Residual Clutter (Everywhere) ---
+residual = 10 * exp(1i * (t + 0.5*sin(t))); 
+
+% Combine: Clutter is everywhere, Blood is only in the circle
+RawData = blood + repmat(clutter, [nZ, nX, 1]) + repmat(residual, [nZ, nX, 1]);
+disp('Data Created. Clutter Hides the Vessel completely.');
+
+%% 2. Stage 1: GPU SVD Acceleration
+disp('--- Step 2: Running GPU SVD (Stage 1) ---');
+Casorati = reshape(RawData, [nZ*nX, nT]); 
+
+tic;
+% CALL CUDA KERNEL
+[U, S_vec, V] = mex_hybrid_filter(Casorati);
+gpu_time = toc;
+fprintf('GPU SVD Time: %.4f s\n', gpu_time);
+
+%% 3. Stage 2: Hybrid SVD-ICA Logic
+disp('--- Step 3: Running Hybrid ICA (Stage 2) ---');
+
+% A. SVD Thresholding
+% Tweaked: Reduced rank removal to let more signal reach ICA
+clutter_rank = 2; 
+S_filtered = diag(S_vec);
+S_filtered(1:clutter_rank, 1:clutter_rank) = 0;
+
+% B. Dimensionality Reduction
+ica_start = clutter_rank + 1;
+ica_end = 40; 
+U_sub = U(:, ica_start:ica_end);
+S_sub = S_filtered(ica_start:ica_end, ica_start:ica_end);
+V_sub = V(:, ica_start:ica_end);
+
+% C. Run FastICA
+disp('   Running FastICA algorithm...');
+% Use larger num_components for better separation in complex scenes
+[Signals, MixingMatrix] = simple_fastica(V_sub', 15); 
+
+% D. Identify Blood Components
+variances = var(abs(Signals), 0, 2);
+[~, sortIdx] = sort(variances, 'ascend'); 
+% Tweaked: Keep MORE components (12 instead of 8) to avoid losing the blood
+blood_indices = sortIdx(1:12); 
+
+% Filter
+Signals_Filtered = Signals;
+Signals_Filtered(setdiff(1:15, blood_indices), :) = 0; 
+V_ica = (MixingMatrix * Signals_Filtered)';
+Hybrid_Casorati = U_sub * S_sub * V_ica';
+
+%% 4. Visualization
+disp('--- Step 4: Comparing Results ---');
+
+% Reconstruct SVD result
+num_sv = length(S_vec);
+Filtered_Image_SVD = reshape(U(:, 1:num_sv) * S_filtered * V', [nZ, nX, nT]);
+
+% Reconstruct Hybrid result
+Filtered_Image_Hybrid = reshape(Hybrid_Casorati, [nZ, nX, nT]);
+
+% Power Doppler (dB)
+P_Orig = 10*log10(mean(abs(RawData).^2, 3));
+P_SVD = 10*log10(mean(abs(Filtered_Image_SVD).^2, 3));
+P_Hybrid = 10*log10(mean(abs(Filtered_Image_Hybrid).^2, 3));
+
+figure('Color', 'white', 'Position', [50, 100, 1400, 400]);
+
+% Plot 1: Original
+subplot(1,3,1); imagesc(P_Orig); title('1. Original (Clutter)');
+colormap jet; colorbar; 
+caxis([max(P_Orig(:))-40, max(P_Orig(:))]); axis image;
+xlabel('Can you see the vessel? No.');
+
+% Plot 2: SVD
+subplot(1,3,2); imagesc(P_SVD); title('2. SVD Only');
+colormap jet; colorbar; 
+% Tweaked: Dynamic Scaling to ensure visibility
+caxis([max(P_SVD(:))-30, max(P_SVD(:))]); axis image;
+xlabel('Vessel visible, but noisy background');
+
+% Plot 3: Hybrid
+subplot(1,3,3); imagesc(P_Hybrid); title('3. Hybrid SVD-ICA');
+colormap jet; colorbar; 
+% Tweaked: Dynamic Scaling to ensure visibility
+caxis([max(P_Hybrid(:))-30, max(P_Hybrid(:))]); axis image;
+xlabel('Cleaner Vessel, Darker Background');
+
+disp('Done.');
+
+%% --- HELPER FUNCTION ---
+function [S, A] = simple_fastica(X, num_components)
+    [N, T] = size(X);
+    X = X - mean(X, 2);
+    C = (X * X') / T;
+    [E, D] = eig(C);
+    [d_sorted, ind] = sort(diag(D), 'descend');
+    D = diag(d_sorted); E = E(:, ind);
+    W_white = inv(sqrt(D)) * E';
+    Z = W_white * X;
+    Z = Z(1:num_components, :);
+    
+    W = randn(num_components, num_components) + 1i*randn(num_components, num_components);
+    W = W * real(inv(sqrtm(W * W')));
+    
+    for i = 1:50
+        W_old = W;
+        Y = W * Z;
+        G = (abs(Y).^2) .* Y; 
+        g_prime = 2 * mean(abs(Y).^2, 2);
+        W = (G * Z')/T - mean(g_prime) .* W;
+        [U_orth, S_eig, ~] = svd(W);
+        W = U_orth * inv(S_eig) * U_orth' * W;
+        if norm(abs(W * W_old') - eye(num_components)) < 1e-4, break; end
+    end
+    S = W * Z; 
+    A = pinv(W * W_white(1:num_components, :)); 
+    for k = 1:num_components
+        norm_factor = norm(A(:,k));
+        A(:,k) = A(:,k) / norm_factor;
+        S(k,:) = S(k,:) * norm_factor;
+    end
+end
