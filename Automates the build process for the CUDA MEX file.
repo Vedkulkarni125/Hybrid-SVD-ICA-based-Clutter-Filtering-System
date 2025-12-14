@@ -1,0 +1,103 @@
+% compile_and_run.m
+% Automates the build process for the CUDA MEX file.
+% FIX: Adds -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH to fix STL1002 error.
+
+clear; clc;
+
+disp('========================================');
+disp('   BUILDING HYBRID SVD-ICA PROJECT      ');
+disp('========================================');
+
+% 1. Configuration: Detect CUDA Path
+cudaRoot = getenv('CUDA_PATH');
+if isempty(cudaRoot)
+    % Fallback for standard installs
+    cudaRoot = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.0'; 
+end
+
+% Verify CUDA Path exists
+if ~exist(cudaRoot, 'dir')
+    % Search specifically for v13 or v12 if the env var is missing
+    basePath = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA';
+    if exist(basePath, 'dir')
+        d = dir(fullfile(basePath, 'v*'));
+        if ~isempty(d)
+             % Sort to get the latest version
+             [~, idx] = sort({d.name});
+             cudaRoot = fullfile(basePath, d(idx(end)).name);
+        end
+    end
+end
+fprintf('Detected CUDA Root: %s\n', cudaRoot);
+
+% 2. Clean Old Builds
+mexName = 'mex_hybrid_filter';
+mexFile = [mexName, '.', mexext];
+if exist(mexFile, 'file')
+    try
+        delete(mexFile);
+        disp('Cleaned old build file.');
+    catch
+        disp('Warning: Could not delete old build file. It might be in use.');
+    end
+end
+
+% 3. Compilation
+disp('Compiling CUDA code...');
+libPath = fullfile(cudaRoot, 'lib', 'x64');
+
+% Define the command arguments
+args = {};
+args{end+1} = '-v';                           % Verbose output
+args{end+1} = ['-L' libPath];                 % Library Path
+args{end+1} = '-lcusolver';                   % Link SVD Lib
+args{end+1} = '-lcudart';                     % Link Runtime Lib
+
+% CRITICAL FIX: 
+% 1. --allow-unsupported-compiler: Fixes "unsupported Visual Studio"
+% 2. -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH: Fixes "STL1002" error
+args{end+1} = 'NVCC_FLAGS=--allow-unsupported-compiler -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH'; 
+
+args{end+1} = [mexName '.cu'];                % Source File
+
+try
+    % Check if file exists in current folder before running
+    if ~exist(fullfile(pwd, [mexName '.cu']), 'file')
+        error('File "%s.cu" not found in Current Folder: %s', mexName, pwd);
+    end
+
+    % Execute mexcuda
+    fprintf('Command args: %s\n', strjoin(args, ' '));
+    mexcuda(args{:});
+    disp('✅ SUCCESS: Compilation Complete!');
+catch ME
+    disp('❌ ERROR: Compilation Failed.');
+    disp('------------------------------------------------');
+    disp(ME.message);
+    disp('------------------------------------------------');
+    disp('Troubleshooting:');
+    disp('1. Ensure "mex_hybrid_filter.cu" is in the Current Folder.');
+    disp('2. The STL flags are required for VS2022 compatibility.');
+    return;
+end
+
+% 4. Functional Verification
+disp('Running Verification Test...');
+try
+    % Create random test data
+    Data = randn(64, 64) + 1i*randn(64, 64);
+    
+    tic;
+    [U, S, V] = mex_hybrid_filter(Data);
+    t_gpu = toc;
+    
+    if ~isempty(S)
+        disp(['✅ Test Passed! GPU Time: ' num2str(t_gpu) 's']);
+        disp('You can now run "run_hybrid_filter.m"');
+    else
+        disp('❌ Test Failed: GPU returned empty results.');
+    end
+catch ME
+    disp('❌ Test Crashing: Runtime error.');
+    disp(ME.message);
+end
