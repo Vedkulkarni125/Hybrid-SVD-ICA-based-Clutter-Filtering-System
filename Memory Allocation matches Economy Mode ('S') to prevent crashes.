@@ -1,0 +1,112 @@
+/*
+ * mex_hybrid_filter.cu
+ * FIX: Memory Allocation matches Economy Mode ('S') to prevent crashes.
+ */
+
+#include "mex.h"
+#include "gpu/mxGPUArray.h"
+#include <cuda_runtime.h>
+#include <cusolverDn.h>
+#include <iostream>
+#include <algorithm>
+
+void mexFunction(int nlhs, mxArray* plhs[], int nrhs, const mxArray* prhs[]) {
+
+    // 1. Initialize GPU
+    mxInitGPU();
+
+    // 2. Check Inputs
+    if (nrhs != 1) {
+        mexErrMsgIdAndTxt("Hybrid:Input", "Usage: [U, S, V] = mex_hybrid_filter(Data)");
+    }
+    const mxArray* inputMx = prhs[0];
+    if (!mxIsComplex(inputMx) || !mxIsDouble(inputMx)) {
+        mexErrMsgIdAndTxt("Hybrid:Input", "Input must be Complex Double.");
+    }
+
+    // 3. Move Data to GPU
+    mxGPUArray const* gpuInput = mxGPUCreateFromMxArray(inputMx);
+    const mwSize* dims = mxGPUGetDimensions(gpuInput);
+    int M = (int)dims[0]; // Rows (Pixels)
+    int N = (int)dims[1]; // Cols (Time)
+
+    // Copy input to a writable GPU array
+    mxGPUArray* gpuA = mxGPUCopyGPUArray(gpuInput);
+    cuDoubleComplex* d_A = (cuDoubleComplex*)mxGPUGetData(gpuA);
+
+    // 4. Allocate Output Memory (CRITICAL FIX)
+
+    // Calculate Economy Size FIRST
+    int minDim = std::min(M, N);
+
+    // U: Allocate (M x minDim) instead of (M x M)
+    // This reduces memory from ~4.3 GB to ~80 MB
+    mwSize uDims[2] = { (mwSize)M, (mwSize)minDim };
+    mxGPUArray* gpuU = mxGPUCreateGPUArray(2, uDims, mxDOUBLE_CLASS, mxCOMPLEX, MX_GPU_DO_NOT_INITIALIZE);
+    cuDoubleComplex* d_U = (cuDoubleComplex*)mxGPUGetData(gpuU);
+
+    // VT: Allocate (minDim x N)
+    mwSize vtDims[2] = { (mwSize)minDim, (mwSize)N };
+    mxGPUArray* gpuVT = mxGPUCreateGPUArray(2, vtDims, mxDOUBLE_CLASS, mxCOMPLEX, MX_GPU_DO_NOT_INITIALIZE);
+    cuDoubleComplex* d_VT = (cuDoubleComplex*)mxGPUGetData(gpuVT);
+
+    // S: Allocate (minDim x 1)
+    mwSize sDims[2] = { (mwSize)minDim, 1 };
+    mxGPUArray* gpuS = mxGPUCreateGPUArray(2, sDims, mxDOUBLE_CLASS, mxREAL, MX_GPU_DO_NOT_INITIALIZE);
+    double* d_S = (double*)mxGPUGetData(gpuS);
+
+    // 5. Setup cuSOLVER
+    cusolverDnHandle_t cusolverH;
+    cusolverDnCreate(&cusolverH);
+
+    // Calculate Workspace Size (Use 'S' for Economy)
+    int lwork = 0;
+    cusolverDnZgesvd_bufferSize(cusolverH, M, N, &lwork);
+
+    cuDoubleComplex* d_work;
+    cudaMalloc(&d_work, sizeof(cuDoubleComplex) * lwork);
+
+    double* d_rwork;
+    cudaMalloc(&d_rwork, sizeof(double) * 5 * minDim);
+
+    int* d_info;
+    cudaMalloc(&d_info, sizeof(int));
+
+    // 6. Run SVD on GPU
+    // Use 'S', 'S' for Economy SVD
+    cusolverDnZgesvd(
+        cusolverH,
+        'S', 'S',      // Use Uppercase 'S' to be safe
+        M, N,
+        d_A, M,
+        d_S,
+        d_U, M,        // Leading dimension of U is M
+        d_VT, minDim,  // Leading dimension of VT is minDim (CRITICAL)
+        d_work, lwork,
+        d_rwork,
+        d_info
+    );
+
+    // 7. Check for Errors
+    int h_info = 0;
+    cudaMemcpy(&h_info, d_info, sizeof(int), cudaMemcpyDeviceToHost);
+    if (h_info != 0) {
+        mexPrintf("SVD Failed! Error Code: %d\n", h_info);
+    }
+
+    // 8. Send Results back to MATLAB
+    plhs[0] = mxGPUCreateMxArrayOnCPU(gpuU);
+    plhs[1] = mxGPUCreateMxArrayOnCPU(gpuS);
+    plhs[2] = mxGPUCreateMxArrayOnCPU(gpuVT);
+
+    // 9. Cleanup
+    mxGPUDestroyGPUArray(gpuInput);
+    mxGPUDestroyGPUArray(gpuA);
+    mxGPUDestroyGPUArray(gpuU);
+    mxGPUDestroyGPUArray(gpuS);
+    mxGPUDestroyGPUArray(gpuVT);
+    cudaFree(d_work);
+    cudaFree(d_rwork);
+    cudaFree(d_info);
+    cusolverDnDestroy(cusolverH);
+}
